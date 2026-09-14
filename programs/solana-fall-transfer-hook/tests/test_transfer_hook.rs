@@ -10,6 +10,7 @@ use {
 
 use helpers::{
     setup, setup_mint_and_extra_metas, create_ata, mint_tokens, build_transfer_with_hook_ix,
+    initialize_rate_limit,
 };
 
 #[test]
@@ -75,4 +76,67 @@ fn test_transfer_hook_rate_limit_exceeded() {
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
     let res = svm.send_transaction(tx);
     assert!(res.is_err(), "Transfer exceeding rate limit should fail");
+}
+
+/// The point of challenge 3.
+///
+/// Two holders of the same mint each send the full cap inside the same window.
+/// Against a single program-wide `[b"rate_limit"]` account the first sender
+/// would consume the cap and the second would be refused — one holder denying
+/// service to every other. Scoped per (mint, owner), both succeed.
+///
+/// Note this test cannot pass by accident: it is the only one with two owners,
+/// so it is the only one that distinguishes a shared limit from a scoped one.
+#[test]
+fn test_rate_limits_are_isolated_per_owner() {
+    let (mut svm, payer, program_id) = setup();
+    let mint = Keypair::new();
+
+    // `setup_mint_and_extra_metas` creates the mint, the extra-account-meta list,
+    // and the payer's own rate limit.
+    setup_mint_and_extra_metas(&mut svm, &payer, &mint, &program_id);
+
+    // A second holder, with their own rate limit account. After challenge 3 this
+    // call is mandatory: every owner must initialize before their first transfer.
+    let second = Keypair::new();
+    svm.airdrop(&second.pubkey(), 10_000_000_000).unwrap();
+    initialize_rate_limit(&mut svm, &second, &mint, &program_id);
+
+    let recipient = Keypair::new();
+    let dest_ata = create_ata(&mut svm, &payer, &recipient.pubkey(), &mint.pubkey());
+
+    let payer_ata = create_ata(&mut svm, &payer, &payer.pubkey(), &mint.pubkey());
+    let second_ata = create_ata(&mut svm, &payer, &second.pubkey(), &mint.pubkey());
+
+    // Each holder starts with exactly the cap.
+    let cap = 1_000_000u64;
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &payer_ata, cap);
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &second_ata, cap);
+
+    // Holder one spends the whole cap.
+    let ix1 = build_transfer_with_hook_ix(
+        &payer_ata, &dest_ata, &mint.pubkey(), &payer.pubkey(), &program_id, cap, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix1], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
+    assert!(
+        svm.send_transaction(tx).is_ok(),
+        "first holder should be able to spend the full cap"
+    );
+
+    // Holder two, same mint, same window, also spends the whole cap.
+    // This is the assertion that fails without per-owner seeds.
+    let ix2 = build_transfer_with_hook_ix(
+        &second_ata, &dest_ata, &mint.pubkey(), &second.pubkey(), &program_id, cap, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix2], Some(&second.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&second]).unwrap();
+    let res = svm.send_transaction(tx);
+    assert!(
+        res.is_ok(),
+        "second holder must have their own limit, not share the first's: {:?}",
+        res.err()
+    );
 }
