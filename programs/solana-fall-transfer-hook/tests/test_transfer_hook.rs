@@ -100,7 +100,7 @@ fn test_rate_limits_are_isolated_per_owner() {
     // call is mandatory: every owner must initialize before their first transfer.
     let second = Keypair::new();
     svm.airdrop(&second.pubkey(), 10_000_000_000).unwrap();
-    initialize_rate_limit(&mut svm, &second, &mint, &program_id);
+    initialize_rate_limit(&mut svm, &second, &mint, &second.pubkey(), &program_id);
 
     let recipient = Keypair::new();
     let dest_ata = create_ata(&mut svm, &payer, &recipient.pubkey(), &mint.pubkey());
@@ -137,6 +137,49 @@ fn test_rate_limits_are_isolated_per_owner() {
     assert!(
         res.is_ok(),
         "second holder must have their own limit, not share the first's: {:?}",
+        res.err()
+    );
+}
+
+/// A sponsored rate limit: one account pays the rent, a different account holds
+/// the tokens.
+///
+/// `Initialize` seeds the rate limit from `owner`, while `transfer_hook` derives
+/// it from the transfer's `owner`. Seeding from `payer` instead makes the two
+/// agree only in the case where payer == owner, which every other test in this
+/// file happens to satisfy — so this is the only test that can tell the two
+/// derivations apart. Against the payer-seeded version the account is created at
+/// an address the hook never resolves, and the transfer fails on a missing
+/// account rather than on anything that names the real cause.
+#[test]
+fn test_rate_limit_can_be_sponsored_by_a_third_party() {
+    let (mut svm, payer, program_id) = setup();
+    let mint = Keypair::new();
+
+    setup_mint_and_extra_metas(&mut svm, &payer, &mint, &program_id);
+
+    // The holder never pays for anything: no airdrop, no lamports of their own.
+    let holder = Keypair::new();
+    initialize_rate_limit(&mut svm, &payer, &mint, &holder.pubkey(), &program_id);
+
+    let holder_ata = create_ata(&mut svm, &payer, &holder.pubkey(), &mint.pubkey());
+    let recipient = Keypair::new();
+    let dest_ata = create_ata(&mut svm, &payer, &recipient.pubkey(), &mint.pubkey());
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &holder_ata, 1_000);
+
+    // The holder signs the transfer; the payer still funds the transaction.
+    let ix = build_transfer_with_hook_ix(
+        &holder_ata, &dest_ata, &mint.pubkey(), &holder.pubkey(), &program_id, 100, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(
+        VersionedMessage::Legacy(msg), &[&payer, &holder],
+    ).unwrap();
+    let res = svm.send_transaction(tx);
+    assert!(
+        res.is_ok(),
+        "a sponsored rate limit must be found by the hook: {:?}",
         res.err()
     );
 }
