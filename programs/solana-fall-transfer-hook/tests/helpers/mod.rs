@@ -1,6 +1,6 @@
 use {
     anchor_lang::{
-        Id, InstructionData, ToAccountMetas,
+        AccountDeserialize, Id, InstructionData, ToAccountMetas,
         solana_program::instruction::{AccountMeta, Instruction},
         system_program::ID as SYSTEM_PROGRAM_ID,
     },
@@ -24,6 +24,12 @@ pub fn setup() -> (LiteSVM, Keypair, Address) {
     let mut svm = LiteSVM::new();
     let bytes = include_bytes!("../../../../target/deploy/solana_fall_transfer_hook.so");
     svm.add_program(program_id, bytes).unwrap();
+
+    // The second program, for challenge 4. Both .so files are embedded at compile
+    // time, so `cargo-build-sbf` has to run before `cargo test` or the tests run
+    // against a stale build — or fail to compile, if one was never built at all.
+    let mover_bytes = include_bytes!("../../../../target/deploy/token_mover.so");
+    svm.add_program(token_mover::ID, mover_bytes).unwrap();
 
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
@@ -166,4 +172,69 @@ pub fn build_transfer_with_hook_ix(
     ix.accounts.push(AccountMeta::new(rate_limit, false));
 
     ix
+}
+
+/// The rate limit PDA for a (mint, owner), and the ExtraAccountMetaList for a mint.
+/// Both are derived from the HOOK program, never the mover.
+pub fn rate_limit_address(mint: &Pubkey, owner: &Pubkey, program_id: &Address) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"rate_limit", mint.as_ref(), owner.as_ref()],
+        program_id,
+    ).0
+}
+
+pub fn extra_metas_address(mint: &Pubkey, program_id: &Address) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"extra-account-metas", mint.as_ref()],
+        program_id,
+    ).0
+}
+
+/// Read back the rate limit account, so a test can assert the hook actually ran
+/// rather than only that the transfer did not fail.
+pub fn read_rate_limit(
+    svm: &LiteSVM,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    program_id: &Address,
+) -> solana_fall_transfer_hook::RateLimit {
+    let address = rate_limit_address(mint, owner, program_id);
+    let account = svm.get_account(&address).expect("rate limit account should exist");
+    solana_fall_transfer_hook::RateLimit::try_deserialize(&mut account.data.as_slice())
+        .expect("rate limit account should deserialize")
+}
+
+/// Build a transfer that goes THROUGH the mover program instead of straight to
+/// Token-2022.
+///
+/// The four named accounts are the mover's own context. The three pushed after
+/// them are remaining accounts: the hook program, its ExtraAccountMetaList, and
+/// the rate limit the list resolves to. The mover finds them by key, so this
+/// order is for readability only — it mirrors the order the hook interface
+/// itself appends them in.
+pub fn build_move_via_program_ix(
+    source_ata: &Pubkey,
+    dest_ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    program_id: &Address,
+    amount: u64,
+) -> Instruction {
+    let mut metas = token_mover::accounts::TransferWithHook {
+        owner: *owner,
+        source_token: *source_ata,
+        mint: *mint,
+        destination_token: *dest_ata,
+        token_program: Token2022::id(),
+    }.to_account_metas(None);
+
+    metas.push(AccountMeta::new_readonly(*program_id, false));
+    metas.push(AccountMeta::new_readonly(extra_metas_address(mint, program_id), false));
+    metas.push(AccountMeta::new(rate_limit_address(mint, owner, program_id), false));
+
+    Instruction::new_with_bytes(
+        token_mover::ID,
+        &token_mover::instruction::TransferWithHook { amount }.data(),
+        metas,
+    )
 }
